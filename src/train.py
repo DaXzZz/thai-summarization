@@ -73,7 +73,7 @@ def main():
 
     # ===== Training arguments =====
     training_args = Seq2SeqTrainingArguments(
-        output_dir="../Model/FineTuned-mT5-ThaiSum",
+        output_dir="../model/FineTuned-mT5-ThaiSum",
         num_train_epochs=1,
         per_device_train_batch_size=8,
         learning_rate=5e-5,  # 0.00005

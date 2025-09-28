@@ -194,6 +194,7 @@ runs/
 outputs/
 results/
 wandb/
+eval_outputs/
 mlruns/
 .mlflow/
 
