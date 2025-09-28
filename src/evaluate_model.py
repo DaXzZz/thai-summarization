@@ -62,7 +62,7 @@ def main():
         "--model",
         type=str,
         required=True,
-        help="Path or HF repo id (e.g., /Model/FineTuned-mT5-ThaiSum or google/mt5-small)",
+        help="Path or HF repo id (e.g., /model/FineTuned-mT5-ThaiSum or google/mt5-small)",
     )
     parser.add_argument(
         "--split",
