@@ -17,7 +17,7 @@ thai-summarization/
 ├── src/                         # Core source code
 │   ├── preprocess.py            # Dataset loading and preprocessing
 │   ├── train.py                 # Model fine-tuning
-│   ├── evaluate.py              # Evaluation (ROUGE, BERTScore)
+│   ├── evaluate_model.py        # Evaluation (ROUGE, BERTScore)
 │   └── summarize.py             # Summarization inference script
 ├── requirements.txt             # Project dependencies
 └── README.md                    # Project documentation
@@ -30,7 +30,7 @@ thai-summarization/
 ### 🪟 Windows
 ```bash
 python -m venv .venv
-.venv\Scripts\activate
+.venv\Scripts\activate     
 pip install -r requirements.txt
 ```
 
@@ -42,6 +42,7 @@ pip install -r requirements.txt
 ```
 
 ### 🔥 Install PyTorch
+> ⚠️ **Important:** Install PyTorch **after** installing requirements.txt
 
 #### 🖥️ Windows / Linux (NVIDIA GPU)
 ```bash
@@ -95,6 +96,9 @@ Fine-tune the `mT5` model on ThaiSum dataset. Supports partial dataset usage via
 ```bash
 # Example: train with 30% of the training set
 python -u "src/train.py" --fraction 0.3
+
+# Example: with full path (Windows)
+python -u "c:\Project\thai-summarization\src\train.py" --fraction 0.3
 ```
 
 📍 **Output:** The trained model will be saved to `Model/FineTuned-mT5-ThaiSum/`
@@ -107,17 +111,26 @@ Evaluate either a fine-tuned model or a zero-shot pre-trained mT5 model.
 
 ### ✅ Fine-tuned Model
 ```bash
-python -u src/evaluate.py \
-  --model /Model/FineTuned-mT5-ThaiSum \
-  --split test
+# Basic evaluation
+python -u src/evaluate_model.py --model /Model/FineTuned-mT5-ThaiSum --split test
+
+# With Windows full path
+python -u C:\Project\thai-summarization\src\evaluate_model.py --model "Model/FineTuned-mT5-ThaiSum" --split test
+
+# With input prefix and sample limit
+python -u C:\Project\thai-summarization\src\evaluate_model.py --model "Model/FineTuned-mT5-ThaiSum" --input_prefix "summarize: " --split test --max_samples 500
 ```
 
 ### 🌏 Zero-shot mT5
 ```bash
-python -u src/evaluate.py \
-  --model google/mt5-small \
-  --input_prefix "summarize: " \
-  --split test
+# Basic zero-shot evaluation
+python -u src/evaluate_model.py --model google/mt5-small --input_prefix "summarize: " --split test
+
+# With Windows full path
+python -u C:\Project\thai-summarization\src\evaluate_model.py --model google/mt5-small --input_prefix "summarize: " --split test
+
+# With sample limit for faster testing
+python -u C:\Project\thai-summarization\src\evaluate_model.py --model google/mt5-small --input_prefix "summarize: " --split test --max_samples 500
 ```
 
 ### 📁 Output Files
@@ -168,6 +181,9 @@ pip cache purge
 
 # Run preprocessing (dataset check)
 python src/preprocess.py
+
+# Training with specific fraction
+python -u "src/train.py" --fraction 0.3
 ```
 
 ---
@@ -179,6 +195,8 @@ python src/preprocess.py
 - **BERTScore:** `xlm-roberta-large` performs best for Thai text
 - **Hardware:** On macOS M-series, `mps` backend runs much faster than CPU
 - **Storage:** Temporary logs in `data/eval_tmp/` can be safely deleted
+- **Windows Users:** Use full paths in commands for better compatibility
+- **Testing:** Use `--max_samples` parameter to limit samples for faster evaluation
 
 ---
 
