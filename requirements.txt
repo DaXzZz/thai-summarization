@@ -1,0 +1,11 @@
+transformers     # Hugging Face Transformers for mT5 model loading, training, inference
+datasets         # Hugging Face Datasets for loading ThaiSum and other datasets
+peft             # Parameter-Efficient Fine-Tuning (LoRA, adapters etc)
+evaluate         # Hugging Face Evaluate library for metrics like ROUGE, BLEU
+sentencepiece    # Required for mT5/T5 tokenizer
+accelerate       # Helper for multi-GPU training/configuration
+rouge-score      # Backend for ROUGE metrics in evaluate library
+bert-score       # For BERTScore evaluation metric
+hf_xet           # Speed up dataset downloads from Hugging Face Hub
+protobuf         # Required for T5 tokenizer conversion
+ipywidgets       # Display progress bar in Jupyter notebook
