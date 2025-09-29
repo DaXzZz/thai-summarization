@@ -32,19 +32,21 @@ from preprocess import load_thaisum, preprocess_dataset  # noqa: E402
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-def decode_text(tokenizer, ids):
+# Convert numbers (token IDs) back to readable text.
+def decode_text(tokenizer, ids): 
     """Decode token ids → text."""
     return tokenizer.batch_decode(
         ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
     )
 
-
+# Fixed an incorrect number (out of range)
+# If not fixed, an "ID out of range" error will occur.
 def sanitize_ids(ids, tokenizer):
     """Clamp invalid token ids to prevent SentencePiece 'id out of range'."""
-    if isinstance(ids, tuple):  # some HF versions return (array, None, ...)
+    if isinstance(ids, tuple):  
         ids = ids[0]
     ids = np.asarray(ids, dtype=np.int64)
-    vocab_len = len(tokenizer)  # safer than tokenizer.vocab_size for SP
+    vocab_len = len(tokenizer) 
     pad_id = tokenizer.pad_token_id or 0
     ids[(ids < 0) | (ids >= vocab_len)] = pad_id
     return ids
@@ -120,28 +122,18 @@ def main():
 
     # ===== Load model/tokenizer =====
     tokenizer = AutoTokenizer.from_pretrained(args.model, legacy=False, use_fast=False)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model).to(device)
+    model = AutoModelForSeq2SeqLM.from_pretrained(args.model).to(device) # Move the model to GPU/CPU
 
     # ===== GenerationConfig (future-proof, no deprecation) =====
     gen_cfg = GenerationConfig.from_model_config(model.config)
     gen_cfg.num_beams = args.num_beams
     gen_cfg.max_length = args.gen_max_len
-    gen_cfg.early_stopping = True
+    gen_cfg.early_stopping = True    
     gen_cfg.do_sample = False
     gen_cfg.no_repeat_ngram_size = 3  # basic anti-repetition
     gen_cfg.length_penalty = 1.0
     gen_cfg.pad_token_id = tokenizer.pad_token_id
     gen_cfg.eos_token_id = getattr(tokenizer, "eos_token_id", gen_cfg.eos_token_id)
-
-    # Block <extra_id_*> sentinel tokens (common leak in zero-shot mT5)
-    bad_tokens = []
-    for i in range(100):
-        tid = tokenizer.convert_tokens_to_ids(f"<extra_id_{i}>")
-        if tid not in (None, tokenizer.unk_token_id):
-            bad_tokens.append([tid])
-    if bad_tokens:
-        gen_cfg.bad_words_ids = bad_tokens
-    model.generation_config = gen_cfg
 
     # ===== Load dataset split =====
     raw = load_thaisum()
