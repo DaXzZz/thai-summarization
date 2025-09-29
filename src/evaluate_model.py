@@ -1,4 +1,4 @@
-# (optional) hide HF symlink warning on Windows; put this before other imports
+# (optional) hide HF symlink warning on Windows
 import os
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -29,7 +29,7 @@ sys.path.append(os.path.join(os.path.dirname(os.getcwd()), "src"))
 from preprocess import load_thaisum, preprocess_dataset  # noqa: E402
 
 
-# ---- helpers ----
+# ---- helper functions ----
 def decode_text(tokenizer, ids):
     """Decode token ids → text."""
     return tokenizer.batch_decode(
@@ -48,8 +48,8 @@ def sanitize_ids(ids, tokenizer):
     return ids
 
 
+# ---- main ----
 def main():
-    # ---- args ----
     parser = argparse.ArgumentParser(
         description="Evaluate Seq2Seq model on ThaiSum (ROUGE & BERTScore)"
     )
@@ -113,7 +113,7 @@ def main():
     if args.input_prefix:
         print(f"🧩 Input prefix: {repr(args.input_prefix)}")
 
-    # ---- load model & tokenizer ----
+    # ---- load model/tokenizer ----
     tokenizer = AutoTokenizer.from_pretrained(args.model, legacy=False, use_fast=False)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model).to(device)
 
@@ -141,9 +141,17 @@ def main():
     # ---- load dataset ----
     raw = load_thaisum()
     ds = raw[args.split]
+    total_len = len(ds)
+
     if args.max_samples:
-        ds = ds.select(range(min(args.max_samples, len(ds))))
-        print(f"📦 Using {len(ds)} samples for evaluation")
+        used_len = min(args.max_samples, total_len)
+        ds = ds.select(range(used_len))
+        pct = round((used_len / total_len) * 100, 2)
+        print(
+            f"📦 Loaded {args.split} split: {used_len} samples ({pct}% of total {total_len})"
+        )
+    else:
+        print(f"📦 Loaded {args.split} split: {total_len} samples (full dataset)")
 
     # add prefix if specified
     if args.input_prefix:
