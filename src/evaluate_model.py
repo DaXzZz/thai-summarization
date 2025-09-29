@@ -18,16 +18,20 @@ from transformers import (
 import evaluate
 import warnings
 
+# ===== Quiet some noisy warnings =====
 warnings.filterwarnings(
     "ignore", category=UserWarning, module="transformers.convert_slow_tokenizer"
 )
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
-# import project-local preprocess helpers
+# ===== Import project-local preprocess helpers =====
 sys.path.append(os.path.join(os.path.dirname(os.getcwd()), "src"))
 from preprocess import load_thaisum, preprocess_dataset  # noqa: E402
 
 
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 def decode_text(tokenizer, ids):
     """Decode token ids → text."""
     return tokenizer.batch_decode(
@@ -37,16 +41,20 @@ def decode_text(tokenizer, ids):
 
 def sanitize_ids(ids, tokenizer):
     """Clamp invalid token ids to prevent SentencePiece 'id out of range'."""
-    if isinstance(ids, tuple):
+    if isinstance(ids, tuple):  # some HF versions return (array, None, ...)
         ids = ids[0]
     ids = np.asarray(ids, dtype=np.int64)
-    vocab_len = len(tokenizer)
+    vocab_len = len(tokenizer)  # safer than tokenizer.vocab_size for SP
     pad_id = tokenizer.pad_token_id or 0
     ids[(ids < 0) | (ids >= vocab_len)] = pad_id
     return ids
 
 
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 def main():
+    # ===== Args =====
     parser = argparse.ArgumentParser(
         description="Evaluate Seq2Seq model on ThaiSum (ROUGE & BERTScore)"
     )
@@ -103,29 +111,29 @@ def main():
     )
     args = parser.parse_args()
 
-    # ---- device ----
+    # ===== Device pick =====
     use_mps = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
     device = "cuda" if torch.cuda.is_available() else ("mps" if use_mps else "cpu")
     print(f"🔧 Device: {device}")
     if args.input_prefix:
         print(f"🧩 Input prefix: {repr(args.input_prefix)}")
 
-    # ---- load model/tokenizer ----
+    # ===== Load model/tokenizer =====
     tokenizer = AutoTokenizer.from_pretrained(args.model, legacy=False, use_fast=False)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model).to(device)
 
-    # generation config (clean, no deprecation warning)
+    # ===== GenerationConfig (future-proof, no deprecation) =====
     gen_cfg = GenerationConfig.from_model_config(model.config)
     gen_cfg.num_beams = args.num_beams
     gen_cfg.max_length = args.gen_max_len
     gen_cfg.early_stopping = True
     gen_cfg.do_sample = False
-    gen_cfg.no_repeat_ngram_size = 3
+    gen_cfg.no_repeat_ngram_size = 3  # basic anti-repetition
     gen_cfg.length_penalty = 1.0
     gen_cfg.pad_token_id = tokenizer.pad_token_id
     gen_cfg.eos_token_id = getattr(tokenizer, "eos_token_id", gen_cfg.eos_token_id)
 
-    # block <extra_id_*> tokens (common in zero-shot mT5)
+    # Block <extra_id_*> sentinel tokens (common leak in zero-shot mT5)
     bad_tokens = []
     for i in range(100):
         tid = tokenizer.convert_tokens_to_ids(f"<extra_id_{i}>")
@@ -135,13 +143,13 @@ def main():
         gen_cfg.bad_words_ids = bad_tokens
     model.generation_config = gen_cfg
 
-    # ---- load dataset ----
+    # ===== Load dataset split =====
     raw = load_thaisum()
     ds = raw[args.split]
     total_len = len(ds)
     if args.max_samples:
         used_len = min(args.max_samples, total_len)
-        ds = ds.select(range(used_len))
+        ds = ds.select(range(used_len))  # take the first N for speed/debug
         pct = round((used_len / total_len) * 100, 2)
         print(
             f"📦 Loaded {args.split} split: {used_len} samples ({pct}% of total {total_len})"
@@ -150,7 +158,7 @@ def main():
         used_len = total_len
         print(f"📦 Loaded {args.split} split: {total_len} samples (full dataset)")
 
-    # ---- optional input prefix ----
+    # ===== Optional input prefix for zero-shot T5/mT5 =====
     if args.input_prefix:
 
         def add_prefix(batch):
@@ -159,23 +167,23 @@ def main():
 
         ds = ds.map(add_prefix, batched=True)
 
-    # ---- preprocess ----
+    # ===== Preprocess (same as training) =====
     tokenized = preprocess_dataset(DatasetDict({args.split: ds}), tokenizer)[args.split]
 
-    # ---- resolve result dirs (./data/{name} or timestamped) ----
+    # ===== Resolve output dirs (timestamp only if name exists and no overwrite) =====
     base_dir = "./data"
-    if args.overwrite_output_dir:
-        run_dir = os.path.join(base_dir, args.name)
-    else:
+    run_dir = os.path.join(base_dir, args.name)
+    if os.path.exists(run_dir) and not args.overwrite_output_dir:
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        print(f"⚠️  Folder '{args.name}' exists → creating '{args.name}_{ts}' instead")
         run_dir = os.path.join(base_dir, f"{args.name}_{ts}")
-    score_dir = os.path.join(run_dir, "score")  # << keep scores/Trainer temp here
+    score_dir = os.path.join(run_dir, "score")
     os.makedirs(score_dir, exist_ok=True)
 
-    # ---- Trainer ----
+    # ===== Trainer (predict_with_generate) =====
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
     eval_args = Seq2SeqTrainingArguments(
-        output_dir=score_dir,
+        output_dir=score_dir,  # keep temp/metrics under the run folder
         per_device_eval_batch_size=args.batch_size,
         predict_with_generate=True,
         generation_max_length=args.gen_max_len,
@@ -189,39 +197,39 @@ def main():
         model=model, args=eval_args, data_collator=data_collator, eval_dataset=tokenized
     )
 
-    # ---- generate ----
+    # ===== Generate summaries =====
     print(
         f"🚀 Generating summaries (beams={args.num_beams}, max_len={args.gen_max_len}) ..."
     )
     preds = trainer.predict(tokenized)
 
-    # ---- decode safely ----
+    # ===== Decode safely (sanitize ids and -100 labels) =====
     pred_ids = sanitize_ids(preds.predictions, tokenizer)
     label_ids = np.asarray(preds.label_ids, dtype=np.int64)
     label_ids[label_ids == -100] = tokenizer.pad_token_id
     label_ids = sanitize_ids(label_ids, tokenizer)
-
     pred_texts = decode_text(tokenizer, pred_ids)
     ref_texts = decode_text(tokenizer, label_ids)
 
-    # ---- compute metrics ----
+    # ===== Metrics: ROUGE & BERTScore =====
     rouge = evaluate.load("rouge")
     rouge_res = rouge.compute(
         predictions=pred_texts, references=ref_texts, use_stemmer=False
     )
+
     bertscore = evaluate.load("bertscore")
     bs = bertscore.compute(
         predictions=pred_texts,
         references=ref_texts,
-        model_type=args.bertscore_model,
-        device=device,
+        model_type=args.bertscore_model,  # default: xlm-roberta-large
+        device=device,  # use available accelerator
         batch_size=args.batch_size,
     )
     bs_p, bs_r, bs_f1 = map(
         lambda arr: float(np.mean(arr)), (bs["precision"], bs["recall"], bs["f1"])
     )
 
-    # ---- pretty print ----
+    # ===== Pretty print to console =====
     pct = lambda x: round(100 * x, 2)
     print("\n🎯 Results")
     print(f"- ROUGE-1 (F1): {pct(rouge_res['rouge1'])}")
@@ -229,7 +237,7 @@ def main():
     print(f"- ROUGE-L (F1): {pct(rouge_res['rougeL'])}")
     print(f"- BERTScore P/R/F1: {pct(bs_p)} / {pct(bs_r)} / {pct(bs_f1)}")
 
-    # ---- save predictions/references with clearer names ----
+    # ===== Save predictions/references =====
     split = args.split
     pred_path = os.path.join(run_dir, f"predictions_{split}.txt")
     ref_path = os.path.join(run_dir, f"references_{split}.txt")
@@ -238,7 +246,7 @@ def main():
     with open(ref_path, "w", encoding="utf-8") as f:
         f.writelines(t.strip() + "\n" for t in ref_texts)
 
-    # ---- save metrics (both JSON and readable text) ----
+    # ===== Save metrics (JSON + readable text) =====
     metrics = {
         "model": args.model,
         "split": args.split,
@@ -264,10 +272,8 @@ def main():
         "batch_size": args.batch_size,
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
     }
-
     with open(os.path.join(score_dir, "metrics.json"), "w", encoding="utf-8") as jf:
         json.dump(metrics, jf, ensure_ascii=False, indent=2)
-
     with open(
         os.path.join(score_dir, "metrics_readable.txt"), "w", encoding="utf-8"
     ) as tf:

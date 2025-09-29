@@ -3,12 +3,13 @@ import sys, os, argparse
 from datetime import datetime
 import warnings
 
+# ===== Silence some noisy warnings =====
 warnings.filterwarnings(
     "ignore", category=UserWarning, module="transformers.convert_slow_tokenizer"
 )
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
-# ให้ import preprocess.py ได้ (อยู่ใน ../src)
+# ===== Make ../src importable (for preprocess.py) =====
 sys.path.append(os.path.join(os.path.dirname(os.getcwd()), "src"))
 
 from transformers import (
@@ -21,9 +22,15 @@ from transformers import (
 from preprocess import load_thaisum, preprocess_dataset, MODEL_NAME
 
 
+# -----------------------------------------------------------------------------
+# Path resolver: ../model/<name> with "timestamp only if exists (and no --overwrite)"
+# -----------------------------------------------------------------------------
 def _resolve_output_dir(name: str, overwrite: bool) -> str:
-    """สร้าง path ./model/<name>, ถ้ามีแล้วจะเติม timestamp กันทับ (เว้นแต่ใช้ --overwrite)"""
-    base = os.path.join(".", "model", name)
+    """
+    Create path ../model/<name>. If the folder already exists and overwrite=False,
+    append a timestamp to avoid clobbering.
+    """
+    base = os.path.join("..", "model", name)  # <- ใช้ ../model ให้ตรงกับ help
     if os.path.isdir(base) and not overwrite:
         ts = datetime.now().strftime("%Y-%m-%d-%H%M")
         print(f"⚠️  Output dir exists: {base} → will use timestamped dir instead.")
@@ -31,8 +38,11 @@ def _resolve_output_dir(name: str, overwrite: bool) -> str:
     return base
 
 
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 def main():
-    # ===== Argument parser =====
+    # ===== Args =====
     parser = argparse.ArgumentParser(description="Train mT5 on ThaiSum dataset")
     parser.add_argument(
         "--size",
@@ -53,7 +63,7 @@ def main():
     )
     args = parser.parse_args()
 
-    # ===== Resolve output_dir =====
+    # ===== Resolve output_dir (timestamp only if name exists and no --overwrite) =====
     output_dir = _resolve_output_dir(args.name, args.overwrite)
     os.makedirs(output_dir, exist_ok=True)
     print(f"📁 Output dir: {output_dir}")
@@ -62,44 +72,44 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, legacy=False, use_fast=False)
     dataset = load_thaisum()
 
-    # แสดงจำนวนข้อมูลทั้งหมดใน train split
+    # ----- Choose train subset by --size (random, reproducible) -----
     total_train = len(dataset["train"])
-
-    # ใช้เฉพาะบางส่วนของ train set ถ้าระบุ --size < 1.0
     if 0 < args.size < 1.0:
-        subset_size = int(total_train * args.size)
-        print(
-            f"⚙️  Using {args.size*100:.0f}% of the training set → {subset_size}/{total_train} samples"
-        )
+        subset_size_est = int(total_train * args.size)
         dataset["train"] = dataset["train"].train_test_split(
             test_size=(1 - args.size), seed=42
         )["train"]
+        actual_train = len(dataset["train"])
+        print(
+            f"⚙️  Using {args.size*100:.0f}% of train → ~{subset_size_est} (actual {actual_train}) / {total_train} samples"
+        )
     elif args.size == 1.0:
         print(f"✅ Using full training dataset → {total_train} samples")
     else:
         print("⚠️  --size should be in (0,1]; fallback to full dataset.")
         args.size = 1.0
+        print(f"✅ Using full training dataset → {total_train} samples")
 
-    # ===== Preprocess =====
+    # ===== Preprocess (tokenize body/summary → input_ids, attention_mask, labels) =====
     tokenized_dataset = preprocess_dataset(dataset, tokenizer)
 
-    # ===== Load model =====
+    # ===== Load base model =====
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
-    # ===== Data collator =====
+    # ===== Data collator (pads batches and aligns labels) =====
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 
-    # ===== Detect hardware & precision =====
+    # ===== Hardware & precision detection =====
     use_mps = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
     use_cuda = torch.cuda.is_available()
     use_bf16 = (use_cuda and torch.cuda.get_device_capability(0)[0] >= 8) or use_mps
 
-    num_workers = 0 if use_mps else 4
+    num_workers = 0 if use_mps else 4  # MPS: avoid multiprocessing workers
     pin_memory = False if use_mps else True
 
     extra_args = dict(
-        bf16=use_bf16,
-        fp16=(use_cuda and not use_bf16),
+        bf16=use_bf16,  # prefer bf16 on Ampere+ or MPS
+        fp16=(use_cuda and not use_bf16),  # else use fp16 on CUDA
     )
 
     device_info = "MPS" if use_mps else ("CUDA" if use_cuda else "CPU")
@@ -107,9 +117,9 @@ def main():
         f"🔧 Device: {device_info}, Workers: {num_workers}, BF16: {use_bf16}, FP16: {extra_args.get('fp16', False)}"
     )
 
-    # ===== Training arguments =====
+    # ===== Training arguments (no eval/save during training for speed) =====
     training_args = Seq2SeqTrainingArguments(
-        output_dir=output_dir,
+        output_dir=output_dir,  # <- ใช้โฟลเดอร์ที่ resolve ด้านบน
         num_train_epochs=1,
         per_device_train_batch_size=8,
         learning_rate=5e-5,
@@ -132,13 +142,13 @@ def main():
         args=training_args,
         train_dataset=tokenized_dataset["train"],
         data_collator=data_collator,
-        processing_class=tokenizer,
+        processing_class=tokenizer,  # ok for current transformers; harmless if ignored
     )
 
     # ===== Train =====
     trainer.train()
 
-    # ===== Save final model =====
+    # ===== Save final model + tokenizer =====
     trainer.save_model(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
     print("✅ Training finished and model saved.")
