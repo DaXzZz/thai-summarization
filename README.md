@@ -56,11 +56,14 @@ pip3 install torch torchvision
 
 ## 🚀 Training (Fine-tuning mT5)
 
-Fine-tune the `mT5` model on ThaiSum dataset. Supports partial dataset usage via `--size` (number of samples).
+Fine-tune the `mT5` model on ThaiSum dataset. Supports partial dataset usage via `--size` (fraction: 0-1).
 
 ```bash
-# Train with 1000 samples
-python src/train.py --size 1000
+# Train with 100% of dataset
+python src/train.py --size 1.0
+
+# Train with 30% of dataset
+python src/train.py --size 0.3
 
 # Train with full dataset (no size limit)
 python src/train.py
@@ -130,7 +133,7 @@ python src/summarize.py --model ./model/FineTuned-100 --text "กรุงเท
 ### Training (`train.py`)
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--fraction` | Fraction of training data to use (0-1) | `1.0` |
+| `--size` | Fraction of training data to use (0-1) | `None` (full dataset) |
 
 ### Evaluation (`evaluate_model.py`)
 | Argument | Description | Default |
