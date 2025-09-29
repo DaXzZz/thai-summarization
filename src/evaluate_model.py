@@ -95,7 +95,7 @@ def main():
     parser.add_argument(
         "--input_prefix",
         type=str,
-        default="",
+        default="summarize: ",
         help="Prefix before input (e.g., 'summarize: ' for zero-shot)",
     )
     parser.add_argument(
