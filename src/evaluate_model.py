@@ -3,7 +3,7 @@ import os
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-import sys, argparse, datetime
+import sys, argparse, datetime, json
 import torch
 import numpy as np
 from datasets import DatasetDict
@@ -18,7 +18,6 @@ from transformers import (
 import evaluate
 import warnings
 
-# quiet down tokenizer-related warnings
 warnings.filterwarnings(
     "ignore", category=UserWarning, module="transformers.convert_slow_tokenizer"
 )
@@ -29,7 +28,6 @@ sys.path.append(os.path.join(os.path.dirname(os.getcwd()), "src"))
 from preprocess import load_thaisum, preprocess_dataset  # noqa: E402
 
 
-# ---- helper functions ----
 def decode_text(tokenizer, ids):
     """Decode token ids → text."""
     return tokenizer.batch_decode(
@@ -48,7 +46,6 @@ def sanitize_ids(ids, tokenizer):
     return ids
 
 
-# ---- main ----
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate Seq2Seq model on ThaiSum (ROUGE & BERTScore)"
@@ -117,7 +114,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, legacy=False, use_fast=False)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model).to(device)
 
-    # generation config (cleaner than overriding model.config)
+    # generation config (clean, no deprecation warning)
     gen_cfg = GenerationConfig.from_model_config(model.config)
     gen_cfg.num_beams = args.num_beams
     gen_cfg.max_length = args.gen_max_len
@@ -142,7 +139,6 @@ def main():
     raw = load_thaisum()
     ds = raw[args.split]
     total_len = len(ds)
-
     if args.max_samples:
         used_len = min(args.max_samples, total_len)
         ds = ds.select(range(used_len))
@@ -151,9 +147,10 @@ def main():
             f"📦 Loaded {args.split} split: {used_len} samples ({pct}% of total {total_len})"
         )
     else:
+        used_len = total_len
         print(f"📦 Loaded {args.split} split: {total_len} samples (full dataset)")
 
-    # add prefix if specified
+    # ---- optional input prefix ----
     if args.input_prefix:
 
         def add_prefix(batch):
@@ -165,16 +162,28 @@ def main():
     # ---- preprocess ----
     tokenized = preprocess_dataset(DatasetDict({args.split: ds}), tokenizer)[args.split]
 
+    # ---- resolve result dirs (./data/{name} or timestamped) ----
+    base_dir = "./data"
+    if args.overwrite_output_dir:
+        run_dir = os.path.join(base_dir, args.name)
+    else:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        run_dir = os.path.join(base_dir, f"{args.name}_{ts}")
+    score_dir = os.path.join(run_dir, "score")  # << keep scores/Trainer temp here
+    os.makedirs(score_dir, exist_ok=True)
+
     # ---- Trainer ----
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
     eval_args = Seq2SeqTrainingArguments(
-        output_dir="./data/eval_tmp",
+        output_dir=score_dir,
         per_device_eval_batch_size=args.batch_size,
         predict_with_generate=True,
         generation_max_length=args.gen_max_len,
         generation_num_beams=args.num_beams,
         dataloader_pin_memory=False if device == "mps" else True,
         report_to="none",
+        save_strategy="no",
+        logging_strategy="no",
     )
     trainer = Seq2SeqTrainer(
         model=model, args=eval_args, data_collator=data_collator, eval_dataset=tokenized
@@ -212,7 +221,7 @@ def main():
         lambda arr: float(np.mean(arr)), (bs["precision"], bs["recall"], bs["f1"])
     )
 
-    # ---- results ----
+    # ---- pretty print ----
     pct = lambda x: round(100 * x, 2)
     print("\n🎯 Results")
     print(f"- ROUGE-1 (F1): {pct(rouge_res['rouge1'])}")
@@ -220,23 +229,60 @@ def main():
     print(f"- ROUGE-L (F1): {pct(rouge_res['rougeL'])}")
     print(f"- BERTScore P/R/F1: {pct(bs_p)} / {pct(bs_r)} / {pct(bs_f1)}")
 
-    # ---- save ----
-    base_dir = "./data"
-    if args.overwrite_output_dir:
-        out_dir = os.path.join(base_dir, args.name)
-    else:
-        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out_dir = os.path.join(base_dir, f"{args.name}_{ts}")
-    os.makedirs(out_dir, exist_ok=True)
-
+    # ---- save predictions/references with clearer names ----
     split = args.split
-    with open(os.path.join(out_dir, f"pred_{split}.txt"), "w", encoding="utf-8") as f:
+    pred_path = os.path.join(run_dir, f"predictions_{split}.txt")
+    ref_path = os.path.join(run_dir, f"references_{split}.txt")
+    with open(pred_path, "w", encoding="utf-8") as f:
         f.writelines(t.strip() + "\n" for t in pred_texts)
-    with open(os.path.join(out_dir, f"ref_{split}.txt"), "w", encoding="utf-8") as f:
+    with open(ref_path, "w", encoding="utf-8") as f:
         f.writelines(t.strip() + "\n" for t in ref_texts)
 
-    print(f"\n📝 Saved predictions to: {out_dir}/pred_{split}.txt")
-    print(f"📝 Saved references  to: {out_dir}/ref_{split}.txt")
+    # ---- save metrics (both JSON and readable text) ----
+    metrics = {
+        "model": args.model,
+        "split": args.split,
+        "num_samples_used": used_len,
+        "generation": {
+            "num_beams": args.num_beams,
+            "max_length": args.gen_max_len,
+            "no_repeat_ngram_size": gen_cfg.no_repeat_ngram_size,
+            "length_penalty": gen_cfg.length_penalty,
+            "input_prefix": args.input_prefix,
+        },
+        "rouge": {
+            "rouge1_f1": float(rouge_res["rouge1"]),
+            "rouge2_f1": float(rouge_res["rouge2"]),
+            "rougeL_f1": float(rouge_res["rougeL"]),
+        },
+        "bertscore": {
+            "precision": bs_p,
+            "recall": bs_r,
+            "f1": bs_f1,
+            "model": args.bertscore_model,
+        },
+        "batch_size": args.batch_size,
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+
+    with open(os.path.join(score_dir, "metrics.json"), "w", encoding="utf-8") as jf:
+        json.dump(metrics, jf, ensure_ascii=False, indent=2)
+
+    with open(
+        os.path.join(score_dir, "metrics_readable.txt"), "w", encoding="utf-8"
+    ) as tf:
+        tf.write("🎯 Results\n")
+        tf.write(f"- ROUGE-1 (F1): {pct(rouge_res['rouge1'])}\n")
+        tf.write(f"- ROUGE-2 (F1): {pct(rouge_res['rouge2'])}\n")
+        tf.write(f"- ROUGE-L (F1): {pct(rouge_res['rougeL'])}\n")
+        tf.write(f"- BERTScore P/R/F1: {pct(bs_p)} / {pct(bs_r)} / {pct(bs_f1)}\n")
+
+    print(f"\n📝 Saved predictions to: {pred_path}")
+    print(f"📝 Saved references  to: {ref_path}")
+    print(
+        f"📊 Saved metrics (json/text) to: {os.path.join(score_dir, 'metrics.json')} / metrics_readable.txt"
+    )
+    print(f"📁 Run folder: {run_dir}")
 
 
 if __name__ == "__main__":
