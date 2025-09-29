@@ -9,16 +9,14 @@ This project implements **Thai text summarization** using **mT5** fine-tuned on 
 ```
 thai-summarization/
 │
-├── data/                        # Temporary results and evaluation logs
-├── Model/                       # Trained models
-│   └── FineTuned-mT5-ThaiSum/   # Fine-tuned model
-│       └── eval_outputs/        # Evaluation outputs (pred/ref)
-├── notebooks/                   # Jupyter notebooks for analysis or visualization
+├── data/                        # Evaluation results and logs
+├── model/                       # Trained models
+├── notebooks/                   # Jupyter notebooks for analysis
 ├── src/                         # Core source code
-│   ├── preprocess.py            # Dataset loading and preprocessing
-│   ├── train.py                 # Model fine-tuning
 │   ├── evaluate_model.py        # Evaluation (ROUGE, BERTScore)
-│   └── summarize.py             # Summarization inference script
+│   ├── preprocess.py            # Dataset loading and preprocessing
+│   ├── summarize.py             # Summarization inference script
+│   └── train.py                 # Model fine-tuning
 ├── requirements.txt             # Project dependencies
 └── README.md                    # Project documentation
 ```
@@ -56,52 +54,19 @@ pip3 install torch torchvision
 
 ---
 
-## 🧩 Data Preprocessing
-
-Prepare the ThaiSum dataset for mT5 training and evaluation.
-
-### Steps:
-1. **Load the ThaiSum dataset**
-   - Keep only `train`, `validation`, `test` splits
-   - Remove duplicate `valid` split if present
-
-2. **Sanity check**
-   - Print dataset size for each split
-   - Show one example row
-
-3. **Tokenization**
-   - Convert text into token IDs using `mT5 tokenizer`
-   - `body` → `input_ids`, `attention_mask`
-   - `summary` → `labels`
-
-4. **Truncation**
-   - Input (body) ≤ 512 tokens
-   - Target (summary) ≤ 128 tokens
-
-5. **Remove unnecessary columns**
-   - Drop `title`, `body`, `summary`, `tags`, `url`, `type`
-   - Keep only `input_ids`, `attention_mask`, `labels`
-
-### 📘 Run preprocessing:
-```bash
-python src/preprocess.py
-```
-
----
-
 ## 🚀 Training (Fine-tuning mT5)
 
-Fine-tune the `mT5` model on ThaiSum dataset. Supports partial dataset usage via `--fraction` (0–1).
+Fine-tune the `mT5` model on ThaiSum dataset. Supports partial dataset usage via `--size` (number of samples).
 
 ```bash
-# Example: train with 30% of the training set
-python -u "src/train.py" --fraction 0.3
+# Train with 1000 samples
+python src/train.py --size 1000
 
-# Example: with full path (Windows)
-python -u "c:\Project\thai-summarization\src\train.py" --fraction 0.3
+# Train with full dataset (no size limit)
+python src/train.py
 ```
 
-📍 **Output:** The trained model will be saved to `Model/FineTuned-mT5-ThaiSum/`
+📍 **Output:** The trained model will be saved to `./model/FineTuned-{steps}/`
 
 ---
 
@@ -112,91 +77,76 @@ Evaluate either a fine-tuned model or a zero-shot pre-trained mT5 model.
 ### ✅ Fine-tuned Model
 ```bash
 # Basic evaluation
-python -u src/evaluate_model.py --model /Model/FineTuned-mT5-ThaiSum --split test
+python src/evaluate_model.py --model ./model/FineTuned-100 --split test
 
-# With Windows full path
-python -u C:\Project\thai-summarization\src\evaluate_model.py --model "Model/FineTuned-mT5-ThaiSum" --split test
+# With sample limit for faster testing
+python src/evaluate_model.py --model ./model/FineTuned-100 --split test --max_samples 500
 
-# With input prefix and sample limit
-python -u C:\Project\thai-summarization\src\evaluate_model.py --model "Model/FineTuned-mT5-ThaiSum" --input_prefix "summarize: " --split test --max_samples 500
+# Custom output folder name
+python src/evaluate_model.py --model ./model/FineTuned-100 --split test --name MyEvalRun
 ```
 
 ### 🌏 Zero-shot mT5
 ```bash
 # Basic zero-shot evaluation
-python -u src/evaluate_model.py --model google/mt5-small --input_prefix "summarize: " --split test
+python src/evaluate_model.py --model google/mt5-small --split test
 
-# With Windows full path
-python -u C:\Project\thai-summarization\src\evaluate_model.py --model google/mt5-small --input_prefix "summarize: " --split test
-
-# With sample limit for faster testing
-python -u C:\Project\thai-summarization\src\evaluate_model.py --model google/mt5-small --input_prefix "summarize: " --split test --max_samples 500
+# With sample limit
+python src/evaluate_model.py --model google/mt5-small --split test --max_samples 500
 ```
 
 ### 📁 Output Files
 ```
-Model/FineTuned-mT5-ThaiSum/eval_outputs/
-├── pred_test.txt   # Model-generated summaries
-└── ref_test.txt    # Reference summaries (ground truth)
+./data/{name}/                   # Default: Results or Results_{timestamp}
+├── predictions_test.txt         # Model-generated summaries
+├── references_test.txt          # Ground truth summaries
+├── inputs_test.txt              # Original input texts
+└── score/
+    ├── metrics.json             # Detailed metrics (JSON)
+    └── metrics_readable.txt     # Human-readable scores
 ```
 
 ---
 
-## 🔄 Evaluation Process
+## 💬 Summarize Custom Text
 
-The evaluation pipeline uses **ROUGE-1/2/L (F1)** and **BERTScore** metrics to assess model quality.
-
-### Process Steps:
-1. **Load model and tokenizer** (path or Hugging Face ID via `--model`)
-2. **Load ThaiSum dataset split** (`validation` / `test`)
-3. **Add input prefix** (optional, e.g., `"summarize: "` for zero-shot)
-4. **Preprocess and tokenize dataset**
-5. **Run generation** using beam search
-6. **Decode predictions** → `pred_texts` & `ref_texts`
-7. **Compute metrics** (ROUGE & BERTScore)
-8. **Report and save results**
-
----
-
-## ⚙️ Evaluation Arguments
-
-| Argument | Description | Example |
-|----------|-------------|---------|
-| `--model` | Model path or Hugging Face ID | `--model /Model/FineTuned-mT5-ThaiSum`<br>`--model google/mt5-small` |
-| `--split` | Dataset split (`validation` or `test`) | `--split test` |
-| `--max_samples` | Limit samples for faster evaluation | `--max_samples 500` |
-| `--num_beams` | Beam search size | `--num_beams 4` |
-| `--gen_max_len` | Maximum generation length (tokens) | `--gen_max_len 128` |
-| `--batch_size` | Evaluation batch size | `--batch_size 8` |
-| `--bertscore_model` | Model for BERTScore computation | `--bertscore_model xlm-roberta-large` |
-| `--input_prefix` | Prefix for zero-shot summarization | `--input_prefix "summarize: "` |
-
----
-
-## 🧹 Additional Commands
+Generate summaries for custom Thai text input.
 
 ```bash
-# Clear pip cache
-pip cache purge
+# Basic usage
+python src/summarize.py --model ./model/FineTuned-100 --text "ข้อความที่ต้องการสรุป..."
 
-# Run preprocessing (dataset check)
-python src/preprocess.py
+# Zero-shot with pretrained mT5
+python src/summarize.py --model google/mt5-small --text "ข้อความที่ต้องการสรุป..."
 
-# Training with specific fraction
-python -u "src/train.py" --fraction 0.3
+# Long text example
+python src/summarize.py --model ./model/FineTuned-100 --text "กรุงเทพมหานคร - วันนี้กรมอุตุนิยมวิทยาพยากรณ์อากาศว่าจะมีฝนฟ้าคะนองในพื้นที่กรุงเทพและปริมณฑล..."
 ```
 
 ---
 
-## 💡 Performance Tips
+## ⚙️ Command Arguments
 
-- **Training:** Use `--fraction` to fine-tune on a percentage of the dataset
-- **Inference:** Larger `--num_beams` → higher quality but slower inference
-- **BERTScore:** `xlm-roberta-large` performs best for Thai text
-- **Hardware:** On macOS M-series, `mps` backend runs much faster than CPU
-- **Storage:** Temporary logs in `data/eval_tmp/` can be safely deleted
-- **Windows Users:** Use full paths in commands for better compatibility
-- **Testing:** Use `--max_samples` parameter to limit samples for faster evaluation
+### Training (`train.py`)
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--fraction` | Fraction of training data to use (0-1) | `1.0` |
+
+### Evaluation (`evaluate_model.py`)
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--model` | Model path or HF ID | **(required)** |
+| `--split` | Dataset split (`validation` / `test`) | `test` |
+| `--max_samples` | Limit samples for faster eval | `None` (full) |
+| `--batch_size` | Evaluation batch size | `8` |
+| `--name` | Output folder name under `./data/` | `Results` |
+| `--overwrite_output_dir` | Overwrite existing output folder | `False` |
+
+### Summarize (`summarize.py`)
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--model` | Model path or HF ID | **(required)** |
+| `--text` | Input text to summarize | **(required)** |
 
 ---
 
