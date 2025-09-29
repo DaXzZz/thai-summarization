@@ -119,7 +119,7 @@ def main():
 
     # ===== Training arguments (no eval/save during training for speed) =====
     training_args = Seq2SeqTrainingArguments(
-        output_dir=output_dir,  # <- ใช้โฟลเดอร์ที่ resolve ด้านบน
+        output_dir=output_dir,
         num_train_epochs=1,
         per_device_train_batch_size=8,
         learning_rate=5e-5,
