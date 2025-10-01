@@ -25,6 +25,14 @@ from transformers import (
 )
 from preprocess import load_thaisum, preprocess_dataset, MODEL_NAME
 
+# (Optional) PEFT for LoRA
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+
+    PEFT_AVAILABLE = True
+except Exception:
+    PEFT_AVAILABLE = False
+
 
 # -----------------------------------------------------------------------------
 # Path resolver: ./model/<name> with "timestamp only if exists (and no --overwrite)"
@@ -56,10 +64,8 @@ def build_compute_metrics(tokenizer):
         preds, labels = eval_pred
         labels = labels.copy()
         labels[labels == -100] = tokenizer.pad_token_id
-
         pred_texts = _decode(preds)
         ref_texts = _decode(labels)
-
         r = rouge.compute(
             predictions=pred_texts, references=ref_texts, use_stemmer=False
         )
@@ -68,13 +74,19 @@ def build_compute_metrics(tokenizer):
     return compute
 
 
+def count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main():
     # ===== Args =====
     parser = argparse.ArgumentParser(
-        description="Train mT5 on ThaiSum dataset (with validation ROUGE & result export)"
+        description="Train mT5 on ThaiSum dataset (with validation ROUGE, optional LoRA, and result export)"
     )
     parser.add_argument(
         "--size",
@@ -93,6 +105,13 @@ def main():
         action="store_true",
         help="ทับโฟลเดอร์โมเดลเดิมถ้ามีอยู่แล้ว (ระวังข้อมูลหาย)",
     )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="จำนวน step ที่จะสะสม gradient ก่อนอัปเดต (ช่วยจำลอง batch ใหญ่ขึ้น)",
+    )
+
     # train hyperparams
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=8)
@@ -112,6 +131,30 @@ def main():
         default=64,
         help="ความยาวสรุประหว่างเทรน (default=64) — greedy decoding",
     )
+
+    # ===== LoRA switches =====
+    parser.add_argument(
+        "--lora", action="store_true", help="เปิดโหมด Low-Rank Adaptation (PEFT)"
+    )
+    parser.add_argument(
+        "--lora_r", type=int, default=8, help="rank ของ LoRA (default=8)"
+    )
+    parser.add_argument(
+        "--lora_alpha", type=int, default=16, help="alpha ของ LoRA (default=16)"
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.05,
+        help="dropout ใน LoRA (default=0.05)",
+    )
+    parser.add_argument(
+        "--lora_target",
+        type=str,
+        default="q,k,v,o,wi_0,wi_1,wo",
+        help="คอมมาแยกรายชื่อโมดูลเป้าหมาย (T5/mT5 แนะนำ: q,k,v,o,wi_0,wi_1,wo)",
+    )
+
     args = parser.parse_args()
 
     # ===== Resolve output_dir =====
@@ -163,8 +206,34 @@ def main():
     # ===== Load base model =====
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
+    # ----- Optionally wrap with LoRA -----
+    lora_info = None
+    if args.lora:
+        if not PEFT_AVAILABLE:
+            raise RuntimeError("ต้องติดตั้ง peft ก่อนใช้งาน LoRA: pip install peft")
+        target_modules = [s.strip() for s in args.lora_target.split(",") if s.strip()]
+        lcfg = LoraConfig(
+            task_type=TaskType.SEQ_2_SEQ_LM,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            inference_mode=False,
+        )
+        model = get_peft_model(model, lcfg)
+        model.print_trainable_parameters()
+        lora_info = {
+            "enabled": True,
+            "r": args.lora_r,
+            "alpha": args.lora_alpha,
+            "dropout": args.lora_dropout,
+            "target_modules": target_modules,
+        }
+    else:
+        lora_info = {"enabled": False}
+
     # ----- Generation config for validation-time eval (FAST, GREEDY) -----
-    # ไม่ตั้ง num_beams (default = 1 → greedy), ไม่ตั้ง length_penalty
     gen_cfg = GenerationConfig.from_model_config(model.config)
     gen_cfg.max_new_tokens = args.eval_max_new_tokens
     gen_cfg.pad_token_id = tokenizer.pad_token_id
@@ -205,6 +274,7 @@ def main():
         predict_with_generate=True,
         dataloader_pin_memory=pin_memory,
         dataloader_num_workers=num_workers,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         logging_steps=100,
         load_best_model_at_end=True,
         metric_for_best_model="rougeL",
@@ -228,7 +298,8 @@ def main():
 
     # ===== Train =====
     train_result = trainer.train()
-    trainer.save_model(training_args.output_dir)
+    # Save model/adapters
+    trainer.save_model(training_args.output_dir)  # PEFT จะเซฟ adapter ถ้าเป็น LoRA
     tokenizer.save_pretrained(training_args.output_dir)
 
     # ===== Extract best eval ROUGE + eval_loss from log history =====
@@ -267,6 +338,8 @@ def main():
     train_sps = tr_metrics.get("train_samples_per_second", None)
     train_stepsps = tr_metrics.get("train_steps_per_second", None)
 
+    total_params, trainable_params = count_params(model)
+
     payload = {
         "model_base": MODEL_NAME,
         "output_dir": output_dir,
@@ -296,6 +369,16 @@ def main():
         "generation_used_for_validation": {
             "decoding": "greedy (num_beams=1)",
             "max_new_tokens": args.eval_max_new_tokens,
+        },
+        "lora": {
+            **lora_info,
+            "trainable_params": int(trainable_params),
+            "total_params": int(total_params),
+            "trainable_ratio_pct": (
+                round(100.0 * trainable_params / total_params, 4)
+                if total_params
+                else None
+            ),
         },
         "hardware": {
             "device": device_info,
@@ -348,9 +431,25 @@ def main():
         f.write(
             f"- decoding: greedy (num_beams=1)\n- max_new_tokens: {args.eval_max_new_tokens}\n"
         )
+        f.write("\n🧩 LoRA\n")
+        if lora_info["enabled"]:
+            f.write(
+                f"- enabled: True\n- r: {lora_info['r']}\n- alpha: {lora_info['alpha']}\n- dropout: {lora_info['dropout']}\n"
+            )
+            f.write(f"- target_modules: {', '.join(lora_info['target_modules'])}\n")
+        else:
+            f.write("- enabled: False\n")
+        f.write(
+            f"- trainable params: {int(trainable_params)} / total: {int(total_params)} "
+            f"({round(100.0 * trainable_params / total_params, 4) if total_params else '—'}%)\n"
+        )
         f.write("\n⏱️ Training time\n")
-        f.write(f"- runtime (s): {train_runtime_sec}\n- train_loss: {train_loss}\n")
-        f.write(f"- samples/s: {train_sps}\n- steps/s: {train_stepsps}\n")
+        f.write(
+            f"- runtime (s): {payload['training_time']['train_runtime_seconds']}\n- train_loss: {payload['training_time']['train_loss']}\n"
+        )
+        f.write(
+            f"- samples/s: {payload['training_time']['train_samples_per_second']}\n- steps/s: {payload['training_time']['train_steps_per_second']}\n"
+        )
 
     print("✅ Training finished and model saved.")
     print(
