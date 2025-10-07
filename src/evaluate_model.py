@@ -7,9 +7,11 @@ warnings.filterwarnings(
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
+import re
 import torch
 import numpy as np
 import evaluate
+from collections import Counter
 from datasets import DatasetDict
 from transformers import (
     AutoTokenizer,
@@ -36,6 +38,49 @@ def _decode(tokenizer, ids):
     return tokenizer.batch_decode(
         ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
     )
+
+
+# --- very light-weight unsupervised keyword extractor (source-only) ---
+_TH_PUNCT_RE = re.compile(r"[^\w\s\u0E00-\u0E7F]")  # keep Thai/word/space
+_MULTI_SPACE_RE = re.compile(r"\s+")
+
+
+def _simple_keywords_from_text(text, topk=10, minlen=2):
+    # 1) normalize spacing & strip punctuation (keep Thai chars)
+    t = _TH_PUNCT_RE.sub(" ", text)
+    t = _MULTI_SPACE_RE.sub(" ", t).strip()
+
+    # 2) crude tokenization by whitespace (works OK for Thai with spaces; lightweight)
+    toks = [tok for tok in t.split(" ") if tok]
+
+    # 3) filter super short tokens / numeric-only tokens
+    def ok(tok):
+        if len(tok) < minlen:
+            return False
+        # drop tokens that are pure digits or punctuation-ish
+        return not tok.isdigit()
+
+    toks = [tok for tok in toks if ok(tok)]
+
+    # 4) frequency top-k
+    cnt = Counter(toks)
+    kws = [w for w, _ in cnt.most_common(topk)]
+    return kws
+
+
+def _build_prefixed_inputs(ds, topk, minlen):
+    # map() over the dataset to attach keyword prefix to body
+    def add_kw_prefix(batch):
+        bodies = batch["body"]
+        new_bodies = []
+        for body in bodies:
+            kws = _simple_keywords_from_text(body, topk=topk, minlen=minlen)
+            kw_str = ", ".join(kws) if kws else ""
+            new_bodies.append(f"Keywords: {kw_str} | Article: {body}")
+        batch["body"] = new_bodies
+        return batch
+
+    return ds.map(add_kw_prefix, batched=True)
 
 
 # ----------------------------- Main ----------------------------
@@ -78,6 +123,26 @@ def main():
         action="store_true",
         help="Overwrite ./data/{name} if exists",
     )
+    # --- NEW: keyword mode for Keyword-trained models ---
+    parser.add_argument(
+        "--use_keywords",
+        action="store_true",
+        help="Prepend unsupervised keywords from the article: "
+        "'Keywords: ... | Article: <body>' (must match how the model was trained).",
+    )
+    parser.add_argument(
+        "--keyword_topk",
+        type=int,
+        default=10,
+        help="How many keywords to prepend when --use_keywords (default: 10).",
+    )
+    parser.add_argument(
+        "--keyword_minlen",
+        type=int,
+        default=2,
+        help="Minimum token length for keywords when --use_keywords (default: 2).",
+    )
+
     args = parser.parse_args()
 
     # ===== Device =====
@@ -103,14 +168,21 @@ def main():
         used_len = total_len
         print(f"📦 Loaded {args.split}: {total_len} samples (full)")
 
+    # ===== OPTIONAL: prepend keywords to inputs (to match keyword-trained model) =====
+    if args.use_keywords:
+        print(
+            f"🧩 Using unsupervised keywords (topk={args.keyword_topk}, minlen={args.keyword_minlen})"
+        )
+        ds = _build_prefixed_inputs(ds, args.keyword_topk, args.keyword_minlen)
+
     # ===== Preprocess =====
     tokenized = preprocess_dataset(DatasetDict({args.split: ds}), tokenizer)[args.split]
 
-    # ===== Generation Config (shorter summaries) =====
+    # ===== Generation Config (match our usual eval defaults) =====
     gen_cfg = GenerationConfig.from_model_config(model.config)
     gen_cfg.num_beams = 4
-    gen_cfg.max_new_tokens = 128  # จำกัดความยาวสรุปสูงสุด
-    gen_cfg.length_penalty = 0.8  # ชอบสั้นหน่อย
+    gen_cfg.max_new_tokens = 128
+    gen_cfg.length_penalty = 0.8
     gen_cfg.pad_token_id = tokenizer.pad_token_id
     gen_cfg.eos_token_id = getattr(tokenizer, "eos_token_id", gen_cfg.eos_token_id)
     model.generation_config = gen_cfg
@@ -186,8 +258,10 @@ def main():
         f.writelines(t.strip() + "\n" for t in pred_texts)
     with open(ref_path, "w", encoding="utf-8") as f:
         f.writelines(t.strip() + "\n" for t in ref_texts)
+    # save inputs actually used (after possible keyword prefixing)
     with open(inp_path, "w", encoding="utf-8") as f:
-        f.writelines(t.strip() + "\n" for t in ds["body"])
+        raw_inputs = ds["body"]
+        f.writelines(t.strip() + "\n" for t in raw_inputs)
 
     metrics = {
         "model": args.model,
@@ -198,6 +272,15 @@ def main():
             "max_new_tokens": 128,
             "length_penalty": 0.8,
         },
+        "used_keywords": bool(args.use_keywords),
+        "keyword_settings": (
+            {
+                "topk": args.keyword_topk,
+                "minlen": args.keyword_minlen,
+            }
+            if args.use_keywords
+            else None
+        ),
         "rouge": {
             "rouge1_f1": float(rouge_res["rouge1"]),
             "rouge2_f1": float(rouge_res["rouge2"]),
