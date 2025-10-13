@@ -123,7 +123,6 @@ def main():
         action="store_true",
         help="Overwrite ./data/{name} if exists",
     )
-    # --- NEW: keyword mode for Keyword-trained models ---
     parser.add_argument(
         "--use_keywords",
         action="store_true",

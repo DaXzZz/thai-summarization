@@ -1,23 +1,24 @@
 # 🧠 Thai Summarization (mT5 + ThaiSum Dataset)
 
-This project implements **Thai text summarization** using **mT5** fine-tuned on the **ThaiSum** dataset. It supports both **fine-tuned** and **zero-shot** evaluation with **ROUGE** and **BERTScore** metrics.
+This project implements **Thai text summarization** using **mT5**, trained and evaluated on the **ThaiSum** dataset.  
+It explores three training strategies — **Full Fine-tuning**, **Parameter-efficient LoRA**, and **Keyword-based Fine-tuning** —  
+and evaluates their performance using **ROUGE** and **BERTScore**.
 
 ---
 
-## 📁 Project Structure
+## 📂 Project Structure
 
 ```
 thai-summarization/
 │
 ├── data/                        # Evaluation results and logs
-├── model/                       # Trained models
-├── notebooks/                   # Jupyter notebooks for analysis
-├── src/                         # Core source code
+├── model/                       # Trained model checkpoints
+├── src/                         # Source code
+│   ├── preprocess.py            # Dataset loading & preprocessing
+│   ├── train.py                 # Full fine-tuning & LoRA
+│   ├── train_keyword.py         # Keyword-based fine-tuning
 │   ├── evaluate_model.py        # Evaluation (ROUGE, BERTScore)
-│   ├── preprocess.py            # Dataset loading and preprocessing
-│   ├── summarize.py             # Summarization inference script
-│   └── train.py                 # Model fine-tuning
-├── requirements.txt             # Project dependencies
+│   └── summarize.py             # Generate summaries
 └── README.md                    # Project documentation
 ```
 
@@ -28,7 +29,7 @@ thai-summarization/
 ### 🪟 Windows
 ```bash
 python -m venv .venv
-.venv\Scripts\activate     
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -40,131 +41,134 @@ pip install -r requirements.txt
 ```
 
 ### 🔥 Install PyTorch
-> ⚠️ **Important:** Install PyTorch **after** installing requirements.txt
 
-#### 🖥️ Windows / Linux (NVIDIA GPU)
+> ⚠️ Install **PyTorch after** installing requirements.txt
+
+#### 🖥️ CUDA GPU
 ```bash
 pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
 
-#### 🍏 macOS (Apple M-series)
+#### 🍏 Apple Silicon (M-series)
 ```bash
 pip3 install torch torchvision
 ```
 
 ---
 
-## 🚀 Training (Fine-tuning mT5)
+## 🚀 Training Methods
 
-Fine-tune the `mT5` model on ThaiSum dataset. Supports partial dataset usage via `--size` (fraction: 0-1).
+### 🧩 1. Full Fine-tuning
+
+Fine-tune the entire **mT5** model on ThaiSum.
 
 ```bash
-# Train with 100% of dataset
-python src/train.py --size 1.0
-
-# Train with 30% of dataset
-python src/train.py --size 0.3
-
-# Train with full dataset (no size limit)
-python src/train.py
+python src/train.py --epochs 2 --learning_rate 5e-5 --batch_size 8 --size 1.0
 ```
 
-📍 **Output:** The trained model will be saved to `./model/FineTuned-{steps}/`
+### ⚙️ 2. LoRA Fine-tuning (Parameter-efficient)
+
+Fine-tune only small adapter layers (~0.4% of parameters).
+
+```bash
+python src/train.py --lora --lora_r 8 --lora_alpha 16 --lora_dropout 0.05 \
+    --epochs 2 --learning_rate 1e-3 --batch_size 8
+```
+
+### 🔑 3. Keyword-based Fine-tuning (Ours)
+
+Train mT5 with **keyword-augmented input**.
+The model receives both extracted keywords and article body:
+
+```
+Keywords: k1, k2, k3 | Article: <text>
+```
+
+```bash
+python src/train_keyword.py --epochs 2 --learning_rate 5e-5 --keyword_mode_train overlap
+```
 
 ---
 
-## 📊 Evaluation (ROUGE + BERTScore)
+## 📊 Evaluation
 
-Evaluate either a fine-tuned model or a zero-shot pre-trained mT5 model.
+Evaluate any trained model or pre-trained mT5 using **ROUGE** and **BERTScore**.
 
-### ✅ Fine-tuned Model
+### Example
+
 ```bash
-# Basic evaluation
+# Fine-tuned
 python src/evaluate_model.py --model ./model/FineTuned-100 --split test
 
-# With sample limit for faster testing
-python src/evaluate_model.py --model ./model/FineTuned-100 --split test --max_samples 500
+# LoRA model
+python src/evaluate_model.py --model ./model/LoRA-100 --split test
 
-# Custom output folder name
-python src/evaluate_model.py --model ./model/FineTuned-100 --split test --name MyEvalRun
+# Keyword-based (with keyword extraction during eval)
+python src/evaluate_model.py --model ./model/Keyword-100 --split test --use_keywords
 ```
 
-### 🌏 Zero-shot mT5
-```bash
-# Basic zero-shot evaluation
-python src/evaluate_model.py --model google/mt5-small --split test
+### Output
 
-# With sample limit
-python src/evaluate_model.py --model google/mt5-small --split test --max_samples 500
 ```
-
-### 📁 Output Files
-```
-./data/{name}/                   # Default: Results or Results_{timestamp}
-├── predictions_test.txt         # Model-generated summaries
-├── references_test.txt          # Ground truth summaries
-├── inputs_test.txt              # Original input texts
+./data/{name}/
+├── predictions_test.txt      # Model-generated summaries
+├── references_test.txt       # Gold summaries
+├── inputs_test.txt           # Input articles (with or w/o keywords)
 └── score/
-    ├── metrics.json             # Detailed metrics (JSON)
-    └── metrics_readable.txt     # Human-readable scores
+    ├── metrics.json          # Detailed metrics
+    └── metrics_readable.txt  # Human-readable results
 ```
 
 ---
 
-## 💬 Summarize Custom Text
+## 🧠 Evaluation Metrics
 
-Generate summaries for custom Thai text input.
+| Metric              | Description                                                                |
+| :------------------ | :------------------------------------------------------------------------- |
+| **ROUGE-1 / 2 / L** | Measures lexical overlap between generated and reference summaries         |
+| **BERTScore (F1)**  | Measures semantic similarity between summaries using contextual embeddings |
+
+---
+
+## 🧪 Experimental Results
+
+| Model                        |  ROUGE-1  |  ROUGE-2  |  ROUGE-L  | BERTScore (F1) | Train Time |
+| :--------------------------- | :-------: | :-------: | :-------: | :------------: | :--------: |
+| **Zero-shot mT5**            |    2.73   |    0.73   |    2.71   |      78.28     |      —     |
+| **Fine-tuned mT5**           |   53.44   |   34.02   |   53.38   |      95.36     |   ~12 hrs  |
+| **LoRA Fine-tuned mT5**      | **53.94** | **34.60** | **53.86** |    **95.47**   |   ~7 hrs   |
+| **Keyword-based mT5 (Ours)** |   42.60   |   25.33   |   42.45   |      93.29     |   ~11 hrs  |
+
+🟩 **LoRA achieved comparable performance to full fine-tuning** while training <1% parameters.
+🟦 **Keyword-based model** produced summaries that are semantically correct (high BERTScore)
+but stylistically different (lower ROUGE).
+
+---
+
+## 💬 Custom Summarization
 
 ```bash
-# Basic usage
-python src/summarize.py --model ./model/FineTuned-100 --text "ข้อความที่ต้องการสรุป..."
-
-# Zero-shot with pretrained mT5
-python src/summarize.py --model google/mt5-small --text "ข้อความที่ต้องการสรุป..."
-
-# Long text example
-python src/summarize.py --model ./model/FineTuned-100 --text "กรุงเทพมหานคร - วันนี้กรมอุตุนิยมวิทยาพยากรณ์อากาศว่าจะมีฝนฟ้าคะนองในพื้นที่กรุงเทพและปริมณฑล..."
+python src/summarize.py --model ./model/FineTuned-100 \
+  --text "กรุงเทพมหานคร - วันนี้กรมอุตุนิยมวิทยาพยากรณ์อากาศว่าจะมีฝนฟ้าคะนอง..."
 ```
 
 ---
 
-## ⚙️ Command Arguments
+## 📖 References
 
-### Training (`train.py`)
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--size` | Fraction of training data to use (0-1) | `None` (full dataset) |
-
-### Evaluation (`evaluate_model.py`)
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--model` | Model path or HF ID | **(required)** |
-| `--split` | Dataset split (`validation` / `test`) | `test` |
-| `--max_samples` | Limit samples for faster eval | `None` (full) |
-| `--batch_size` | Evaluation batch size | `8` |
-| `--name` | Output folder name under `./data/` | `Results` |
-| `--overwrite_output_dir` | Overwrite existing output folder | `False` |
-
-### Summarize (`summarize.py`)
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--model` | Model path or HF ID | **(required)** |
-| `--text` | Input text to summarize | **(required)** |
-
----
-
-## 📖 References & Credits
-
-- **Dataset:** [ThaiSum (PyThaiNLP)](https://huggingface.co/datasets/pythainlp/thaisum)
-- **Base Model:** [google/mt5-small](https://huggingface.co/google/mt5-small)
-- **Metrics:** [Hugging Face Evaluate (ROUGE, BERTScore)](https://huggingface.co/docs/evaluate)
+* **Dataset:** [ThaiSum (PyThaiNLP)](https://huggingface.co/datasets/pythainlp/thaisum)
+* **Base Model:** [google/mt5-small](https://huggingface.co/google/mt5-small)
+* **LoRA Technique:** Hu et al., *LoRA: Low-Rank Adaptation of Large Language Models*, ICLR 2022
+* **Keyword-based Approach:** Adapted from *Automatic Thai Text Summarization Using Keyword-Based Abstractive Method (2022)*
+* **Evaluation:** [Hugging Face Evaluate – ROUGE, BERTScore](https://huggingface.co/docs/evaluate)
 
 ---
 
 <div align="center">
 
-**Author:** Nontapat Chucharnchai  
-**Environment:** Python 3.10+, PyTorch, Hugging Face Transformers  
-**License:** Research / Academic use only
+**Author:** Nontapat Chucharnchai
+**Advisor:** —
+**Environment:** Python 3.10+, PyTorch, Hugging Face Transformers
+**License:** Research / Academic Use Only
 
 </div>
