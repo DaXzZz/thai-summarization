@@ -1,3 +1,13 @@
+"""
+Evaluate a seq2seq summarization model on ThaiSum with ROUGE and BERTScore.
+
+Highlights:
+- Supports validation/test split with optional sample cap for quick runs
+- Optional unsupervised keyword prefixing to match keyword-trained models
+- Beam-search decoding (num_beams=4) with length penalty
+- Saves predictions, references, inputs, and machine-readable metrics
+"""
+
 import os, sys, argparse, datetime, json
 import warnings
 
@@ -29,6 +39,10 @@ from preprocess import load_thaisum, preprocess_dataset  # noqa: E402
 
 # --------------------------- Helpers ---------------------------
 def _decode(tokenizer, ids):
+    """
+    Safe batch decode helper: handles tuple inputs, coerces to ndarray,
+    clamps invalid token ids to pad, and strips special tokens.
+    """
     if isinstance(ids, tuple):
         ids = ids[0]
     ids = np.asarray(ids, dtype=np.int64)
@@ -41,35 +55,47 @@ def _decode(tokenizer, ids):
 
 
 # --- very light-weight unsupervised keyword extractor (source-only) ---
-_TH_PUNCT_RE = re.compile(r"[^\w\s\u0E00-\u0E7F]")  # keep Thai/word/space
+# keep Thai block + word chars + spaces; drop other punctuation
+_TH_PUNCT_RE = re.compile(r"[^\w\s\u0E00-\u0E7F]")
 _MULTI_SPACE_RE = re.compile(r"\s+")
 
 
 def _simple_keywords_from_text(text, topk=10, minlen=2):
-    # 1) normalize spacing & strip punctuation (keep Thai chars)
+    """
+    Minimal keyword extractor (frequency-based):
+      1) strip non-Thai/word punctuation, normalize spaces
+      2) whitespace tokenization
+      3) filter too-short tokens and pure digits
+      4) top-k by frequency
+    """
+    # 1) normalize
     t = _TH_PUNCT_RE.sub(" ", text)
     t = _MULTI_SPACE_RE.sub(" ", t).strip()
 
-    # 2) crude tokenization by whitespace (works OK for Thai with spaces; lightweight)
+    # 2) crude tokenization
     toks = [tok for tok in t.split(" ") if tok]
 
-    # 3) filter super short tokens / numeric-only tokens
+    # 3) filter
     def ok(tok):
         if len(tok) < minlen:
             return False
-        # drop tokens that are pure digits or punctuation-ish
         return not tok.isdigit()
 
     toks = [tok for tok in toks if ok(tok)]
 
-    # 4) frequency top-k
+    # 4) top-k by frequency
     cnt = Counter(toks)
     kws = [w for w, _ in cnt.most_common(topk)]
     return kws
 
 
 def _build_prefixed_inputs(ds, topk, minlen):
-    # map() over the dataset to attach keyword prefix to body
+    """
+    Map over dataset to prepend unsupervised keywords:
+      "Keywords: k1, k2, ... | Article: <body>"
+    This must mirror how the model was trained if --use_keywords is set.
+    """
+
     def add_kw_prefix(batch):
         bodies = batch["body"]
         new_bodies = []
@@ -85,6 +111,10 @@ def _build_prefixed_inputs(ds, topk, minlen):
 
 # ----------------------------- Main ----------------------------
 def main():
+    """
+    CLI entrypoint: loads model + ThaiSum split, optionally prefixes keywords,
+    generates summaries with beam search, computes ROUGE/BERTScore, and saves artifacts.
+    """
     parser = argparse.ArgumentParser(
         description="Evaluate model on ThaiSum (ROUGE & BERTScore) — LITE"
     )
@@ -145,11 +175,13 @@ def main():
     args = parser.parse_args()
 
     # ===== Device =====
+    # Prefer CUDA, otherwise Apple MPS, otherwise CPU
     use_mps = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
     device = "cuda" if torch.cuda.is_available() else ("mps" if use_mps else "cpu")
     print(f"🔧 Device: {device}")
 
     # ===== Load model/tokenizer =====
+    # legacy=False + use_fast=False to keep tokenizer behavior stable across runs
     tokenizer = AutoTokenizer.from_pretrained(args.model, legacy=False, use_fast=False)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model).to(device)
     model.eval()
@@ -257,7 +289,7 @@ def main():
         f.writelines(t.strip() + "\n" for t in pred_texts)
     with open(ref_path, "w", encoding="utf-8") as f:
         f.writelines(t.strip() + "\n" for t in ref_texts)
-    # save inputs actually used (after possible keyword prefixing)
+    # Save the actual inputs used (post-prefix if --use_keywords)
     with open(inp_path, "w", encoding="utf-8") as f:
         raw_inputs = ds["body"]
         f.writelines(t.strip() + "\n" for t in raw_inputs)

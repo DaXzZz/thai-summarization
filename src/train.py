@@ -1,3 +1,8 @@
+"""
+Fine-tune mT5 model on ThaiSum dataset with optional LoRA
+Supports validation ROUGE metrics, customizable training size, and comprehensive logging
+"""
+
 import torch
 import sys, os, argparse
 from datetime import datetime
@@ -6,13 +11,13 @@ import json
 import numpy as np
 import evaluate
 
-# ===== Silence some noisy warnings =====
+# ===== Suppress warnings =====
 warnings.filterwarnings(
     "ignore", category=UserWarning, module="transformers.convert_slow_tokenizer"
 )
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
-# ===== Make ../src importable (for preprocess.py) =====
+# ===== Add ../src to path for imports =====
 sys.path.append(os.path.join(os.path.dirname(os.getcwd()), "src"))
 
 from transformers import (
@@ -25,7 +30,7 @@ from transformers import (
 )
 from preprocess import load_thaisum, preprocess_dataset, MODEL_NAME
 
-# (Optional) PEFT for LoRA
+# Try importing PEFT for LoRA support
 try:
     from peft import LoraConfig, get_peft_model, TaskType
 
@@ -34,10 +39,16 @@ except Exception:
     PEFT_AVAILABLE = False
 
 
-# -----------------------------------------------------------------------------
-# Path resolver: ./model/<name> with "timestamp only if exists (and no --overwrite)"
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
 def _resolve_output_dir(name: str, overwrite: bool) -> str:
+    """
+    Determine output directory: ./model/<name>
+    Adds timestamp if directory exists and overwrite is False
+    """
     base = os.path.join(".", "model", name)
     if os.path.isdir(base) and not overwrite:
         ts = datetime.now().strftime("%Y-%m-%d-%H%M")
@@ -47,25 +58,31 @@ def _resolve_output_dir(name: str, overwrite: bool) -> str:
 
 
 def build_compute_metrics(tokenizer):
+    """Build ROUGE metric computation function for Trainer"""
     rouge = evaluate.load("rouge")
 
     def _decode(ids):
+        """Safely decode token IDs to text, handling edge cases"""
         if isinstance(ids, tuple):
             ids = ids[0]
         ids = np.asarray(ids, dtype=np.int64)
         pad_id = tokenizer.pad_token_id or 0
         vocab_len = len(tokenizer)
+        # Replace invalid IDs with pad token
         ids[(ids < 0) | (ids >= vocab_len)] = pad_id
         return tokenizer.batch_decode(
             ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
         )
 
     def compute(eval_pred):
+        """Compute ROUGE scores for predictions vs labels"""
         preds, labels = eval_pred
         labels = labels.copy()
-        labels[labels == -100] = tokenizer.pad_token_id
+        labels[labels == -100] = tokenizer.pad_token_id  # Replace ignore index
+
         pred_texts = _decode(preds)
         ref_texts = _decode(labels)
+
         r = rouge.compute(
             predictions=pred_texts, references=ref_texts, use_stemmer=False
         )
@@ -75,19 +92,24 @@ def build_compute_metrics(tokenizer):
 
 
 def count_params(model):
+    """Count total and trainable parameters"""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Main Training Pipeline
+# =============================================================================
+
+
 def main():
-    # ===== Args =====
+    # ===== Parse arguments =====
     parser = argparse.ArgumentParser(
         description="Train mT5 on ThaiSum dataset (with validation ROUGE, optional LoRA, and result export)"
     )
+
+    # Dataset and output config
     parser.add_argument(
         "--size",
         type=float,
@@ -112,13 +134,14 @@ def main():
         help="จำนวน step ที่จะสะสม gradient ก่อนอัปเดต (ช่วยจำลอง batch ใหญ่ขึ้น)",
     )
 
-    # train hyperparams
+    # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--seed", type=int, default=42)
-    # speed-up validation during training
+
+    # Validation config (for speed during training)
     parser.add_argument(
         "--eval_max_samples",
         type=int,
@@ -132,7 +155,7 @@ def main():
         help="ความยาวสรุประหว่างเทรน (default=64) — greedy decoding",
     )
 
-    # ===== LoRA switches =====
+    # LoRA configuration
     parser.add_argument(
         "--lora", action="store_true", help="เปิดโหมด Low-Rank Adaptation (PEFT)"
     )
@@ -157,16 +180,16 @@ def main():
 
     args = parser.parse_args()
 
-    # ===== Resolve output_dir =====
+    # ===== Setup output directory =====
     output_dir = _resolve_output_dir(args.name, args.overwrite)
     os.makedirs(output_dir, exist_ok=True)
     print(f"📁 Output dir: {output_dir}")
 
-    # ===== Load dataset + tokenizer =====
+    # ===== Load tokenizer and dataset =====
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, legacy=False, use_fast=False)
-    dataset = load_thaisum()  # ควรมี train / validation / test
+    dataset = load_thaisum()  # Contains train/validation/test splits
 
-    # ----- Choose train subset by --size (random, reproducible) -----
+    # ===== Sample training data if size < 1.0 =====
     total_train = len(dataset["train"])
     if 0 < args.size < 1.0:
         subset_size_est = int(total_train * args.size)
@@ -184,16 +207,17 @@ def main():
         args.size = 1.0
         print(f"✅ Using full training dataset → {total_train} samples")
 
-    # ===== Preprocess =====
+    # ===== Tokenize dataset =====
     tokenized = preprocess_dataset(dataset, tokenizer)
     train_ds = tokenized["train"]
     eval_full = tokenized.get("validation", None)
+
     if eval_full is None:
         raise ValueError(
             "ไม่พบ validation split ใน dataset — กรุณาตรวจ preprocess/load_thaisum()"
         )
 
-    # ---- Slice validation for faster evaluation ----
+    # Subset validation for faster evaluation during training
     if args.eval_max_samples and args.eval_max_samples < len(eval_full):
         eval_ds = eval_full.select(range(args.eval_max_samples))
         print(
@@ -206,11 +230,12 @@ def main():
     # ===== Load base model =====
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
-    # ----- Optionally wrap with LoRA -----
+    # ===== Apply LoRA if requested =====
     lora_info = None
     if args.lora:
         if not PEFT_AVAILABLE:
             raise RuntimeError("ต้องติดตั้ง peft ก่อนใช้งาน LoRA: pip install peft")
+
         target_modules = [s.strip() for s in args.lora_target.split(",") if s.strip()]
         lcfg = LoraConfig(
             task_type=TaskType.SEQ_2_SEQ_LM,
@@ -223,6 +248,7 @@ def main():
         )
         model = get_peft_model(model, lcfg)
         model.print_trainable_parameters()
+
         lora_info = {
             "enabled": True,
             "r": args.lora_r,
@@ -233,21 +259,23 @@ def main():
     else:
         lora_info = {"enabled": False}
 
-    # ----- Generation config for validation-time eval (FAST, GREEDY) -----
+    # ===== Configure generation for validation =====
+    # Use fast greedy decoding during training
     gen_cfg = GenerationConfig.from_model_config(model.config)
     gen_cfg.max_new_tokens = args.eval_max_new_tokens
     gen_cfg.pad_token_id = tokenizer.pad_token_id
     gen_cfg.eos_token_id = getattr(tokenizer, "eos_token_id", gen_cfg.eos_token_id)
-    model.generation_config = gen_cfg  # ให้ Trainer อ่านค่านี้ตอน predict_with_generate=True
+    model.generation_config = gen_cfg
 
-    # ===== Data collator =====
+    # ===== Setup data collator =====
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 
-    # ===== Hardware & precision detection =====
+    # ===== Detect hardware and configure precision =====
     use_mps = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
     use_cuda = torch.cuda.is_available()
     use_bf16 = (use_cuda and torch.cuda.get_device_capability(0)[0] >= 8) or use_mps
 
+    # MPS requires special handling for dataloader
     num_workers = 0 if use_mps else 4
     pin_memory = False if use_mps else True
 
@@ -261,7 +289,7 @@ def main():
         f"🔧 Device: {device_info}, Workers: {num_workers}, BF16: {use_bf16}, FP16: {extra_args.get('fp16', False)}"
     )
 
-    # ===== Training arguments (with validation ROUGE) =====
+    # ===== Configure training arguments =====
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         num_train_epochs=args.epochs,
@@ -269,9 +297,9 @@ def main():
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="linear",
-        eval_strategy="epoch",  # รองรับเวอร์ชัน transformers เก่า
+        eval_strategy="epoch",
         save_strategy="epoch",
-        predict_with_generate=True,
+        predict_with_generate=True,  # Enable generation during eval
         dataloader_pin_memory=pin_memory,
         dataloader_num_workers=num_workers,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -285,7 +313,7 @@ def main():
         **extra_args,
     )
 
-    # ===== Trainer =====
+    # ===== Initialize Trainer =====
     trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
@@ -296,25 +324,30 @@ def main():
         processing_class=tokenizer,
     )
 
-    # ===== Train =====
+    # ===== Train model =====
     train_result = trainer.train()
-    # Save model/adapters
-    trainer.save_model(training_args.output_dir)  # PEFT จะเซฟ adapter ถ้าเป็น LoRA
+
+    # Save model (LoRA will save adapters only)
+    trainer.save_model(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
 
-    # ===== Extract best eval ROUGE + eval_loss from log history =====
+    # ===== Extract best metrics from training history =====
     best = None
     best_loss = None
     last_eval = None
+
     for rec in trainer.state.log_history:
+        # Track best ROUGE-L
         if "eval_rougeL" in rec:
             last_eval = rec
             if (best is None) or (rec["eval_rougeL"] > best["eval_rougeL"]):
                 best = rec
+        # Track best loss
         if "eval_loss" in rec:
             if (best_loss is None) or (rec["eval_loss"] < best_loss["eval_loss"]):
                 best_loss = rec
 
+    # Handle case where no eval was run
     if best is None:
         best = {
             "eval_rouge1": None,
@@ -327,11 +360,11 @@ def main():
     if last_eval is None:
         last_eval = {"eval_loss": None, "eval_rougeL": None, "step": None}
 
-    # ===== Save training-time metrics + hyperparams =====
+    # ===== Save comprehensive training results =====
     result_dir = os.path.join(output_dir, "result")
     os.makedirs(result_dir, exist_ok=True)
 
-    # training runtime info from trainer/train_result
+    # Extract training metrics
     tr_metrics = getattr(train_result, "metrics", {}) or {}
     train_runtime_sec = tr_metrics.get("train_runtime", None)
     train_loss = tr_metrics.get("train_loss", None)
@@ -340,6 +373,7 @@ def main():
 
     total_params, trainable_params = count_params(model)
 
+    # Build results payload
     payload = {
         "model_base": MODEL_NAME,
         "output_dir": output_dir,
@@ -396,11 +430,13 @@ def main():
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
 
+    # Save JSON report
     with open(
         os.path.join(result_dir, "metrics_train.json"), "w", encoding="utf-8"
     ) as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
+    # Save human-readable report
     with open(
         os.path.join(result_dir, "metrics_train_readable.txt"), "w", encoding="utf-8"
     ) as f:
@@ -412,6 +448,7 @@ def main():
         f.write(f"- ROUGE-1 (F1): {pct(best['eval_rouge1'])}\n")
         f.write(f"- ROUGE-2 (F1): {pct(best['eval_rouge2'])}\n")
         f.write(f"- ROUGE-L (F1): {pct(best['eval_rougeL'])}\n\n")
+
         f.write("📉 Validation Loss\n")
         f.write(
             f"- Best eval_loss: {best_loss['eval_loss']} (step {best_loss.get('step')})\n"
@@ -419,6 +456,7 @@ def main():
         f.write(
             f"- Last  eval_loss: {last_eval.get('eval_loss')} (step {last_eval.get('step')})\n\n"
         )
+
         f.write("⚙️ Hyperparameters\n")
         f.write(
             f"- epochs: {args.epochs}\n- batch_size: {args.batch_size}\n- learning_rate: {args.learning_rate}\n"
@@ -427,10 +465,12 @@ def main():
             f"- warmup_ratio: {args.warmup_ratio}\n- lr_scheduler_type: linear\n- seed: {args.seed}\n"
         )
         f.write(f"- size_fraction: {args.size}\n")
+
         f.write("\n🧪 Generation for validation\n")
         f.write(
             f"- decoding: greedy (num_beams=1)\n- max_new_tokens: {args.eval_max_new_tokens}\n"
         )
+
         f.write("\n🧩 LoRA\n")
         if lora_info["enabled"]:
             f.write(
@@ -443,6 +483,7 @@ def main():
             f"- trainable params: {int(trainable_params)} / total: {int(total_params)} "
             f"({round(100.0 * trainable_params / total_params, 4) if total_params else '—'}%)\n"
         )
+
         f.write("\n⏱️ Training time\n")
         f.write(
             f"- runtime (s): {payload['training_time']['train_runtime_seconds']}\n- train_loss: {payload['training_time']['train_loss']}\n"

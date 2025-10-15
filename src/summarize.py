@@ -1,3 +1,13 @@
+"""
+Summarize a custom input string with a Seq2Seq model (e.g., mT5 fine-tuned on ThaiSum).
+
+Features:
+- Auto device selection (CUDA / MPS / CPU)
+- Clean, safe tokenization (truncates to 512)
+- Beam search decoding with length penalty
+- Prints both input and generated summary
+"""
+
 import os, sys, argparse, warnings
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, GenerationConfig
@@ -27,30 +37,34 @@ def main():
     )
     args = parser.parse_args()
 
-    # ===== Device =====
+    # ===== Device selection =====
+    # Prefer CUDA, otherwise Apple MPS, otherwise CPU
     use_mps = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
     device = "cuda" if torch.cuda.is_available() else ("mps" if use_mps else "cpu")
     print(f"🔧 Device: {device}")
 
     # ===== Load model & tokenizer =====
+    # Note: legacy=False + use_fast=False to avoid slow-tokenizer warnings and ensure stability
     tokenizer = AutoTokenizer.from_pretrained(args.model, legacy=False, use_fast=False)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model).to(device)
     model.eval()
 
-    # ===== Encode input  =====
+    # ===== Encode input =====
+    # Truncate long inputs to 512 tokens (encoder side) to avoid OOM / excessive latency
     enc = tokenizer(
         [args.text.strip()],
         return_tensors="pt",
         truncation=True,
-        max_length=512, 
+        max_length=512,
         padding=True,
     ).to(device)
 
-    # ===== Generation Config (same spirit as evaluate_model.py) =====
+    # ===== Generation config (aligned with evaluation script style) =====
+    # Beam search for higher-quality summaries; limit length and bias toward brevity
     gen_cfg = GenerationConfig.from_model_config(model.config)
     gen_cfg.num_beams = 4
-    gen_cfg.max_new_tokens = 128  
-    gen_cfg.length_penalty = 0.8 
+    gen_cfg.max_new_tokens = 128
+    gen_cfg.length_penalty = 0.8  # <1 encourages shorter outputs
     gen_cfg.pad_token_id = tokenizer.pad_token_id
     gen_cfg.eos_token_id = getattr(tokenizer, "eos_token_id", gen_cfg.eos_token_id)
     model.generation_config = gen_cfg

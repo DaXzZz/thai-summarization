@@ -1,3 +1,14 @@
+"""
+Train mT5 on ThaiSum with keyword-guided inputs.
+
+Key features:
+- Optional keyword prefixing (overlap-based for train, unsupervised for val)
+- Validation-time ROUGE (greedy decode) via HF evaluate
+- Size-controlled training subset for speed/fair comparisons
+- Hardware-aware precision (bf16/fp16) and data loader tuning
+- Saves structured JSON + readable TXT metrics
+"""
+
 import os, sys, argparse
 from datetime import datetime
 import warnings
@@ -31,6 +42,10 @@ from preprocess import load_thaisum, preprocess_dataset, MODEL_NAME
 # Path resolver: ./model/<name> with timestamp if exists (no --overwrite)
 # ---------------------------------------------------------------------
 def _resolve_output_dir(name: str, overwrite: bool) -> str:
+    """
+    Resolve output directory under ./model/<name>.
+    If the directory already exists and --overwrite is False, append a timestamp.
+    """
     base = os.path.join(".", "model", name)
     if os.path.isdir(base) and not overwrite:
         ts = datetime.now().strftime("%Y-%m-%d-%H%M")
@@ -40,20 +55,23 @@ def _resolve_output_dir(name: str, overwrite: bool) -> str:
 
 
 # --------------------------- Keyword helpers ---------------------------
+# Thai Unicode block and basic ASCII token pattern (words/numbers)
 _TH_RE = r"[\u0E00-\u0E7F]+"
 _EN_RE = r"[A-Za-z0-9]+"
 _TOKEN_RE = re.compile(f"{_TH_RE}|{_EN_RE}")
 
 
 def _simple_word_tokenize(text: str):
-    """ดึง 'หน่วยคำ' แบบเรียบง่าย: ช่วงอักษรไทยติดกัน หรือ a-z0-9 ติดกัน"""
+    """Simple token extractor: contiguous Thai sequences or contiguous [A-Za-z0-9] sequences."""
     if not text:
         return []
     return _TOKEN_RE.findall(text)
 
 
 def _topk_from_counts(counts: dict, k: int):
-    # เรียงตาม frequency มาก→น้อย, ถ้าเท่ากันให้คำยาวกว่านิดนึง
+    """
+    Return top-k tokens by frequency (desc). If ties, prefer slightly longer tokens.
+    """
     return [
         w
         for w, _ in sorted(
@@ -63,7 +81,10 @@ def _topk_from_counts(counts: dict, k: int):
 
 
 def _extract_keywords_overlap(body: str, summary: str, topk: int = 10, minlen: int = 2):
-    """คีย์เวิร์ดจาก 'คำที่อยู่ทั้งใน body และ summary' (ใช้เฉพาะตอน train)"""
+    """
+    Overlap-based keywords: tokens that appear in BOTH body and gold summary.
+    Used for TRAIN to simulate keyword hints derived from references.
+    """
     bw = [w for w in _simple_word_tokenize(body)]
     sw = set(_simple_word_tokenize(summary))
     counts = {}
@@ -74,7 +95,10 @@ def _extract_keywords_overlap(body: str, summary: str, topk: int = 10, minlen: i
 
 
 def _extract_keywords_unsupervised(body: str, topk: int = 10, minlen: int = 2):
-    """คีย์เวิร์ดแบบ unsupervised จากตัวบทความอย่างเดียว (ใช้ตอน validation)"""
+    """
+    Unsupervised keywords: frequency-based tokens from body only (no gold summary).
+    Used for VALIDATION to keep a fair setting.
+    """
     bw = [w for w in _simple_word_tokenize(body)]
     counts = {}
     for w in bw:
@@ -84,6 +108,10 @@ def _extract_keywords_unsupervised(body: str, topk: int = 10, minlen: int = 2):
 
 
 def _prefix_with_keywords(body: str, keywords, sep: str = ", "):
+    """
+    Construct input prefix: "Keywords: k1, k2, ... | Article: <body>"
+    Fallback to "Article: <body>" if keywords are empty.
+    """
     kw_str = sep.join(keywords) if keywords else ""
     if kw_str:
         return f"Keywords: {kw_str} | Article: {body}"
@@ -93,9 +121,14 @@ def _prefix_with_keywords(body: str, keywords, sep: str = ", "):
 
 # --------------------------- Metrics helpers ---------------------------
 def build_compute_metrics(tokenizer):
+    """
+    Build a compute_metrics callback for Seq2SeqTrainer that returns ROUGE-1/2/L.
+    Handles label -100 -> pad_token_id and sanitizes invalid token ids.
+    """
     rouge = evaluate.load("rouge")
 
     def _decode(ids):
+        # Accept tuple from Trainer, coerce to ndarray, and sanitize ids
         if isinstance(ids, tuple):
             ids = ids[0]
         ids = np.asarray(ids, dtype=np.int64)
@@ -121,6 +154,7 @@ def build_compute_metrics(tokenizer):
 
 
 def count_params(model):
+    """Return (total_params, trainable_params) for the given model."""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
@@ -130,6 +164,10 @@ def count_params(model):
 # Main
 # ---------------------------------------------------------------------
 def main():
+    """
+    CLI entrypoint: trains mT5 with keyword-guided inputs.
+    Follows train.py's training/eval strategies for fair comparison.
+    """
     parser = argparse.ArgumentParser(
         description="Train mT5 on ThaiSum with keyword-guided input (fair comparison to full/LoRA)."
     )
@@ -223,6 +261,10 @@ def main():
 
     # ===== Build keyword-guided inputs BEFORE tokenization =====
     def add_keywords_train(batch):
+        """
+        TRAIN: build inputs with keyword prefix.
+        Mode 'overlap' uses gold summary overlap; 'unsupervised' uses body-only frequency.
+        """
         bodies = batch["body"]
         sums = batch["summary"]
         out = []
@@ -240,12 +282,17 @@ def main():
         return batch
 
     def add_keywords_val(batch):
+        """
+        VALIDATION: default to 'unsupervised' keywords for fairness (no gold access).
+        'overlap' is intentionally disallowed to avoid leaking reference info.
+        """
         bodies = batch["body"]
         # default: unsupervised (ไม่ใช้สรุปทอง)
         out = []
         for b in bodies:
             if args.keyword_mode_val == "overlap":
-                # หากอยากทดสอบ overlap (ไม่แนะนำสำหรับความแฟร์) ต้องมี summary ใน split; ถ้าไม่มีจะ fallback unsupervised
+                # If you want to experiment with overlap at val time, wire it manually.
+                # Disallowed here by design for fair evaluation.
                 raise ValueError(
                     "keyword_mode_val=overlap ไม่แนะนำและไม่ได้รองรับในสคริปต์นี้เพื่อความแฟร์"
                 )
@@ -277,6 +324,7 @@ def main():
     # ===== Preprocess =====
     tokenized = preprocess_dataset(dataset, tokenizer)
     train_ds = tokenized["train"]
+    # Re-tokenize only the (possibly sliced) validation set to keep mapping consistent
     eval_ds = preprocess_dataset(DatasetDict({"validation": eval_ds_raw}), tokenizer)[
         "validation"
     ]
@@ -289,7 +337,8 @@ def main():
     gen_cfg.max_new_tokens = args.eval_max_new_tokens
     gen_cfg.pad_token_id = tokenizer.pad_token_id
     gen_cfg.eos_token_id = getattr(tokenizer, "eos_token_id", gen_cfg.eos_token_id)
-    model.generation_config = gen_cfg  # Trainer จะใช้ค่านี้เมื่อ predict_with_generate=True
+    # Trainer uses model.generation_config when predict_with_generate=True
+    model.generation_config = gen_cfg
 
     # ===== Data collator =====
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
@@ -297,6 +346,7 @@ def main():
     # ===== Hardware & precision detection =====
     use_mps = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
     use_cuda = torch.cuda.is_available()
+    # Prefer bf16 on Ampere+ (or MPS path), otherwise fp16 on CUDA if available
     use_bf16 = (use_cuda and torch.cuda.get_device_capability(0)[0] >= 8) or use_mps
 
     num_workers = 0 if use_mps else 4
@@ -317,7 +367,7 @@ def main():
         output_dir=output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
-        learning_rate=args.learning_rate,  # เหมือน full fine-tune (ไม่ใช่ 1e-3 แบบ LoRA)
+        learning_rate=args.learning_rate,  # match full fine-tune (not LoRA's 1e-3)
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="linear",
         eval_strategy="epoch",
@@ -357,14 +407,17 @@ def main():
     best_loss = None
     last_eval = None
     for rec in trainer.state.log_history:
+        # Track best ROUGE-L
         if "eval_rougeL" in rec:
             last_eval = rec
             if (best is None) or (rec["eval_rougeL"] > best["eval_rougeL"]):
                 best = rec
+        # Track best (lowest) eval_loss
         if "eval_loss" in rec:
             if (best_loss is None) or (rec["eval_loss"] < best_loss["eval_loss"]):
                 best_loss = rec
 
+    # Fallback guards when no eval logs were produced
     if best is None:
         best = {
             "eval_rouge1": None,
@@ -439,6 +492,7 @@ def main():
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
 
+    # Persist JSON + readable TXT summaries
     with open(
         os.path.join(result_dir, "metrics_train.json"), "w", encoding="utf-8"
     ) as f:
